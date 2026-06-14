@@ -357,9 +357,22 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	}
 	server_recalc_eweight(srv, 1);
 
-	/* load server IP address */
-	if (strcmp(params[0], "-") != 0)
-		srv->lastaddr = strdup(params[0]);
+	/* The whole service-discovery state (FQDN, server address, service port
+	 * and health-check/agent endpoints) is replayed below in a single, fixed
+	 * order so that the restored values stay consistent with each other and
+	 * with the runtime (re)resolution logic:
+	 *
+	 *   1. FQDN / SRV-record linkage  (decides who "owns" the address)
+	 *   2. service port
+	 *   3. server address (lastaddr, the runtime-discovered address)
+	 *   4. SSL
+	 *   5. health-check then agent address/port
+	 *
+	 * In particular the saved server address must be replayed *after* the
+	 * FQDN/SRV-record state (and not before, as it used to be) so that it only
+	 * ever acts as a seed that a subsequent resolution can override, never the
+	 * other way around.
+	 */
 
 	if (fqdn && srv->hostname) {
 		if (strcmp(srv->hostname, fqdn) == 0) {
@@ -433,6 +446,23 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 
 	if (port_st)
 		srv->svc_port = port_svc;
+
+	/* Restore the last known server address (the address discovered at
+	 * runtime by the previous process and dumped in the state file). It is
+	 * consumed by srv_init_addr() as the "init-addr last" candidate.
+	 *
+	 * This is intentionally replayed here, after the FQDN/SRV-record state and
+	 * the service port, so it behaves as a mere seed: a later runtime
+	 * (re)resolution of the restored hostname will take precedence over it.
+	 *
+	 * For servers whose address is owned by an SRV record, we must not restore
+	 * it at all. Their address (and port) are provided exclusively by the SRV
+	 * resolution, so replaying the previous address would let stale state
+	 * shadow a fresh service-discovery result, leaving the forwarding and/or
+	 * check address pointing at an outdated endpoint.
+	 */
+	if (strcmp(params[0], "-") != 0 && !srv->srvrq)
+		srv->lastaddr = strdup(params[0]);
 
 
 	if (params[16]) {
