@@ -1,0 +1,105 @@
+#REGTEST_TYPE=devel
+#REQUIRE_OPTIONS=OPENSSL
+
+# This test checks that "add ssl crt-list" behaves as an atomic transaction
+# when the same crt-list is shared by several "bind" lines and instance
+# generation succeeds on one bind but fails on another.
+#
+# A crt-list entry is turned into one ckch_inst per bind_conf that uses the
+# crt-list. If generation fails on one bind after it already succeeded on
+# another, the partially-built state must be rolled back cleanly, leaving the
+# live store and the bind SNI trees untouched (all-or-nothing).
+#
+# Deterministic per-bind failure mechanism:
+#   The added entry requests "ssl-min-ver TLSv1.3". The first bind also caps
+#   the version with "ssl-max-ver TLSv1.2". On that bind the effective range is
+#   min(TLSv1.3) > max(TLSv1.2), which disables every TLS version and makes
+#   ssl_sock_prepare_ctx() return a fatal error. The second bind has no cap, so
+#   the very same entry prepares successfully there.
+#
+# Ordering: crt-list bind_conf nodes are PREPENDED, so the last-configured bind
+# is generated first. The succeeding bind (ssl-ok) is therefore configured LAST
+# so it is generated first and staged; then the failing bind (ssl-fail) errors,
+# which is exactly the path that must roll back a non-empty staging list.
+#
+# Before the fix this rollback walked the staging list through the wrong list
+# member (by_ckchs instead of by_crtlist_entry) and also left the succeeding
+# instance linked in the live store, corrupting memory; the corruption typically
+# surfaced on the next "add ssl crt-list". After the fix the failed add leaves
+# no trace and a subsequent add succeeds.
+
+varnishtest "Atomic rollback of 'add ssl crt-list' on partial per-bind failure"
+feature cmd "command -v socat"
+feature ignore_unknown_macro
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+    .if !ssllib_name_startswith(AWS-LC)
+        tune.ssl.default-dh-param 2048
+    .endif
+        crt-base ${testdir}/certs
+        stats socket "${tmpdir}/h1/stats" level admin
+
+    defaults
+        mode tcp
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    # Configured FIRST -> generated LAST. Capped at TLSv1.2: a later entry that
+    # requests ssl-min-ver TLSv1.3 will fail to prepare on this bind only.
+    listen ssl-fail
+        bind "fd@${sslfail}" ssl crt-list "${testdir}/certs/localhost.crt-list" ssl-max-ver TLSv1.2
+        server s1 127.0.0.1:1
+
+    # Configured LAST -> generated FIRST and staged. No version cap, so the same
+    # entry prepares fine here.
+    listen ssl-ok
+        bind "fd@${sslok}" ssl crt-list "${testdir}/certs/localhost.crt-list"
+        server s1 127.0.0.1:1
+} -start
+
+# Sanity: the certificate already present in the crt-list is loaded and the
+# store is walkable before we start mutating it.
+haproxy h1 -cli {
+    send "show ssl cert ${testdir}/certs/common.pem"
+    expect ~ ".*SHA1 FingerPrint: DF3B6E847A7BF83DFAAFCFEC65EE9BC36230D3EA"
+}
+
+# Failing add: succeeds on the ssl-ok bind (generated first, staged) then fails
+# on the ssl-fail bind (min TLSv1.3 > max TLSv1.2). The whole transaction must
+# be rolled back. The handler reports the failure with "Failed!".
+shell {
+    printf "add ssl crt-list ${testdir}/certs/localhost.crt-list <<\n${testdir}/certs/common.pem [ssl-min-ver TLSv1.3] localhost\n\n" | socat "${tmpdir}/h1/stats" - | grep -i "Failed"
+}
+
+# Atomicity: the failed entry (the only one carrying "ssl-min-ver TLSv1.3") must
+# NOT have been added to the crt-list.
+haproxy h1 -cli {
+    send "show ssl crt-list ${testdir}/certs/localhost.crt-list"
+    expect !~ "ssl-min-ver TLSv1.3"
+}
+
+# Liveness/integrity: the process did not crash and the store is still walkable
+# (the original certificate is intact).
+haproxy h1 -cli {
+    send "show ssl cert ${testdir}/certs/common.pem"
+    expect ~ ".*SHA1 FingerPrint: DF3B6E847A7BF83DFAAFCFEC65EE9BC36230D3EA"
+}
+
+# Recovery: an entry that prepares on every bind (no version cap) must succeed.
+# With the pre-fix corruption from the previous step, this add would walk a
+# dangling instance left in the live store and crash; with the fix it is clean.
+shell {
+    printf "add ssl crt-list ${testdir}/certs/localhost.crt-list <<\n${testdir}/certs/common.pem [verify none] recovery.example.com\n\n" | socat "${tmpdir}/h1/stats" - | grep -i "Success"
+}
+
+# The recovery entry (uniquely identified by its "recovery.example.com" filter)
+# is now present in the crt-list.
+haproxy h1 -cli {
+    send "show ssl crt-list ${testdir}/certs/localhost.crt-list"
+    expect ~ "recovery.example.com"
+}

@@ -1186,7 +1186,12 @@ static void cli_release_add_crtlist(struct appctx *appctx)
 		LIST_DELETE(&entry->by_crtlist);
 		LIST_DELETE(&entry->by_ckch_store);
 
-		list_for_each_entry_safe(inst, inst_s, &entry->ckch_inst, by_ckchs) {
+		/* The staged instances are linked on entry->ckch_inst through
+		 * their by_crtlist_entry member (not by_ckchs), so we must walk
+		 * that member here. They are only ever present on this list
+		 * during generation; a successful insert clears ctx->entry so
+		 * this rollback never runs after the live store was touched. */
+		list_for_each_entry_safe(inst, inst_s, &entry->ckch_inst, by_crtlist_entry) {
 			ckch_inst_free(inst);
 		}
 		crtlist_free_filters(entry->filters);
@@ -1264,6 +1269,7 @@ static int cli_io_handler_add_crtlist(struct appctx *appctx)
 					ctx->err = NULL;
 					errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, new_inst->ssl_conf, sni->ctx, sni->ckch_inst, &ctx->err);
 					if (errcode & ERR_CODE) {
+						ckch_inst_free(new_inst);
 						ctx->state = ADDCRT_ST_ERROR;
 						goto error;
 					}
@@ -1271,22 +1277,28 @@ static int cli_io_handler_add_crtlist(struct appctx *appctx)
 			}
 
 			i++;
-			LIST_APPEND(&store->ckch_inst, &new_inst->by_ckchs);
+			/* Stage the new instance on the entry only. It is NOT linked
+			 * into the live store->ckch_inst nor into the bind_conf SNI
+			 * trees yet: that happens atomically in ADDCRT_ST_INSERT once
+			 * every bind_conf has been generated. This keeps the live
+			 * structures untouched across yields so a later failure (or a
+			 * client abort) can roll back by freeing the staging list in
+			 * cli_release_add_crtlist() without corrupting the store. */
 			LIST_APPEND(&entry->ckch_inst, &new_inst->by_crtlist_entry);
 			new_inst->crtlist_entry = entry;
 		}
 		ctx->state = ADDCRT_ST_INSERT;
 		__fallthrough;
 	case ADDCRT_ST_INSERT:
-		/* the insertion is called for every instance of the store, not
-		 * only the one we generated.
-		 * But the ssl_sock_load_cert_sni() skip the sni already
-		 * inserted. Not every instance has a bind_conf, it could be
-		 * the store of a server so we should be careful */
-
-		list_for_each_entry(new_inst, &store->ckch_inst, by_ckchs) {
-			if (!new_inst->bind_conf) /* this is a server instance */
-				continue;
+		/* Atomically commit the staged instances. Every bind_conf has
+		 * been generated successfully by now, so this phase only performs
+		 * pointer operations that cannot fail: link each new instance into
+		 * the live store->ckch_inst and insert its SNIs into the owning
+		 * bind_conf tree. The new instances were staged on
+		 * entry->ckch_inst (via by_crtlist_entry) during generation and
+		 * all carry a bind_conf, so there is no server instance to skip. */
+		list_for_each_entry(new_inst, &entry->ckch_inst, by_crtlist_entry) {
+			LIST_APPEND(&store->ckch_inst, &new_inst->by_ckchs);
 			HA_RWLOCK_WRLOCK(SNI_LOCK, &new_inst->bind_conf->sni_lock);
 			ssl_sock_load_cert_sni(new_inst, new_inst->bind_conf);
 			HA_RWLOCK_WRUNLOCK(SNI_LOCK, &new_inst->bind_conf->sni_lock);
