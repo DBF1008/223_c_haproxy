@@ -207,27 +207,40 @@ static int parse_header_line(struct ist header, struct eb_root *st_tree,
 	return 1;
 }
 
-/* Preload an individual counter instance stored at <counter> with <token>
- * value> for the <col> stat column.
- *
- * Returns 0 on success else non-zero if counter was not updated.
+/* Pending counter write resolved while parsing a stats-file line. Values are
+ * first collected for a whole object and only committed once every field of
+ * that object could be parsed, so that a single corrupted or version-drifted
+ * field never leaves an object with a mix of restored and fresh counters.
  */
-static int load_ctr(const struct stat_col *col, const struct ist token,
-                    void* counter)
+struct stcol_pending {
+	const struct stat_col *col; /* column the value belongs to */
+	void *counter;              /* live counter address to update */
+	struct field value;         /* parsed value, ready to be applied */
+};
+
+/* Parse <token> for the <col> stat column into <value> without touching any
+ * live counter. The supported field format/nature combinations are validated
+ * here so that a later apply_ctr() call is guaranteed to succeed and can never
+ * leave a partially applied object behind.
+ *
+ * Returns 0 on success else non-zero if the token could not be parsed or the
+ * column type is not loadable.
+ */
+static int parse_ctr(const struct stat_col *col, const struct ist token,
+                     struct field *value)
 {
 	const enum field_nature fn = stcol_nature(col);
 	const enum field_format ff = stcol_format(col);
 	const char *ptr = istptr(token);
-	struct field value;
 
 	switch (ff) {
 	case FF_U64:
-		value.u.u64 = read_uint64(&ptr, istend(token));
+		value->u.u64 = read_uint64(&ptr, istend(token));
 		break;
 
 	case FF_S32:
 	case FF_U32:
-		value.u.u32 = read_uint(&ptr, istend(token));
+		value->u.u32 = read_uint(&ptr, istend(token));
 		break;
 
 	default:
@@ -239,21 +252,33 @@ static int load_ctr(const struct stat_col *col, const struct ist token,
 	if (ptr != istend(token))
 		return 1;
 
-	if (fn == FN_COUNTER && ff == FF_U64) {
-		*(uint64_t *)counter = value.u.u64;
-	}
-	else if (fn == FN_RATE && ff == FF_U32) {
-		preload_freq_ctr(counter, value.u.u32);
-	}
-	else if (fn == FN_AGE && (ff == FF_U32 || ff == FF_S32)) {
-		*(uint32_t *)counter = ns_to_sec(now_ns) - value.u.u32;
-	}
-	else {
-		/* Unsupported field format/nature combination. */
+	/* Reject unsupported format/nature combinations now so that the commit
+	 * phase in apply_ctr() cannot fail.
+	 */
+	if (!((fn == FN_COUNTER && ff == FF_U64) ||
+	      (fn == FN_RATE && ff == FF_U32) ||
+	      (fn == FN_AGE && (ff == FF_U32 || ff == FF_S32))))
 		return 1;
-	}
 
 	return 0;
+}
+
+/* Commit a previously parsed <value> for the <col> stat column into <counter>.
+ * The value must have been validated by parse_ctr() first, hence this never
+ * fails.
+ */
+static void apply_ctr(const struct stat_col *col, const struct field *value,
+                      void *counter)
+{
+	const enum field_nature fn = stcol_nature(col);
+	const enum field_format ff = stcol_format(col);
+
+	if (fn == FN_COUNTER && ff == FF_U64)
+		*(uint64_t *)counter = value->u.u64;
+	else if (fn == FN_RATE && ff == FF_U32)
+		preload_freq_ctr(counter, value->u.u32);
+	else if (fn == FN_AGE && (ff == FF_U32 || ff == FF_S32))
+		*(uint32_t *)counter = ns_to_sec(now_ns) - value->u.u32;
 }
 
 /* Parse a non header stats-file line <line>. Specify current parsing <domain>
@@ -265,6 +290,7 @@ static int parse_stat_line(struct ist line,
                            enum stfile_domain domain,
                            const struct stat_col *cols[])
 {
+	struct stcol_pending pending[STAT_FILE_MAX_COL_COUNT];
 	struct guid_node *node;
 	struct listener *li;
 	struct server *srv;
@@ -273,6 +299,7 @@ static int parse_stat_line(struct ist line,
 	char *base_off, *base_off_shared;
 	char *guid;
 	int i, off;
+	int npending, corrupt;
 
 	token = istsplit(&line, ',');
 	guid = ist0(token);
@@ -367,22 +394,56 @@ static int parse_stat_line(struct ist line,
 		goto err;
 	}
 
+	/* Phase 1: parse and validate every field of the object before applying
+	 * any of them. This keeps the preload atomic at the object level: a
+	 * single corrupted or version-incompatible field makes us discard the
+	 * whole line, leaving the live counters fresh instead of half-restored
+	 * (which would otherwise expose a mix of old and new values once the
+	 * proxy is displayed or its stats inherited across a reload).
+	 */
+	npending = 0;
+	corrupt = 0;
 	i = 0;
 	while (istlen(line) && i < STAT_FILE_MAX_COL_COUNT) {
 		const struct stat_col *col = cols[i++];
+		void *counter;
 
 		token = istsplit(&line, ',');
 		if (!istlen(token))
-			continue;
+			continue; /* empty field: nothing to load for this column */
 
 		if (!col)
-			continue;
+			continue; /* unknown/incompatible column: silently skipped */
 
 		if (col->flags & STAT_COL_FL_SHARED)
-			load_ctr(col, token, base_off_shared + col->metric.offset[off]);
+			counter = base_off_shared + col->metric.offset[off];
 		else
-			load_ctr(col, token, base_off + col->metric.offset[off]);
+			counter = base_off + col->metric.offset[off];
+
+		if (parse_ctr(col, token, &pending[npending].value)) {
+			/* Poison the whole object: keep consuming the line so the
+			 * parser stays in sync, but make sure nothing is applied.
+			 */
+			corrupt = 1;
+			continue;
+		}
+
+		pending[npending].col = col;
+		pending[npending].counter = counter;
+		++npending;
 	}
+
+	/* If any field could not be parsed, drop the whole object to avoid a mix
+	 * of restored and fresh counters. Report it as an ignored line only when
+	 * valid fields were also present (data would actually be lost), otherwise
+	 * stay silent since a fully unparsable line carries nothing to restore.
+	 */
+	if (corrupt)
+		return npending ? 1 : 0;
+
+	/* Phase 2: every field parsed cleanly, commit them all atomically. */
+	for (i = 0; i < npending; i++)
+		apply_ctr(pending[i].col, &pending[i].value, pending[i].counter);
 
 	return 0;
 
@@ -813,7 +874,7 @@ static void shm_stats_file_preload(void)
 					} else if (curr_obj->type == SHM_STATS_FILE_OBJECT_TYPE_BE) {
 						if (!px->be_counters.shared.tg)
 							px->be_counters.shared.tg = calloc(global.nbtgroups, sizeof(*px->be_counters.shared.tg));
-						if (px->fe_counters.shared.tg == NULL)
+						if (px->be_counters.shared.tg == NULL)
 							goto release;
 						px->be_counters.shared.tg[obj_tgid - 1] = &curr_obj->data.be;
 					} else

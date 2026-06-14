@@ -1,0 +1,153 @@
+varnishtest "Atomic per-object counter preload via stats-file (partial corruption + multiple reloads)"
+
+# A stats-file (or its shm-stats-file equivalent) is preloaded object by object,
+# field by field. When a single field of an object is corrupted or comes from a
+# drifted format, the whole object must be discarded: it must never be left
+# half-restored with a mix of fresh and restored counters, otherwise /stats and
+# the CLI would expose inconsistent values after a reload.
+#
+# This test preloads the same persisted stats-file in several successive
+# instances (each one stands for a worker started by a reload generation) and
+# checks that:
+#   - fully valid objects are entirely restored,
+#   - objects with a corrupted field are entirely dropped (no partial restore),
+#   - the behaviour stays identical across reload generations,
+#   - a later, clean stats-file restores the previously dropped objects.
+
+feature cmd "$HAPROXY_PROGRAM -cc 'version_atleast(3.0-dev9)'"
+feature ignore_unknown_macro
+
+# --- generation 1: preload the partially corrupted stats-file -----------------
+haproxy h1 -conf {
+	global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+		stats-file ${testdir}/sample-stats-file-preload
+
+	defaults
+		timeout client 30s
+		timeout server 30s
+		timeout connect 30s
+
+	frontend fe
+		guid guid-fe
+		bind "fd@${feS}"
+
+	frontend fe2
+		guid guid-fe2
+		bind "fd@${fe2S}"
+
+	backend be
+		guid guid-be
+		server srv 127.0.0.1:11111 guid guid-srv
+} -start
+
+haproxy h1 -cli {
+	# fe: fully valid object, both fields restored
+	send "show stat fe 15 -1 typed"
+	expect ~ "F.*conn_tot.*:u64:4096"
+	send "show stat fe 15 -1 typed"
+	expect ~ "F.*stot.*:u64:2048"
+
+	# fe2: corrupted field -> whole object dropped, valid conn_tot must NOT leak
+	send "show stat fe2 15 -1 typed"
+	expect !~ "conn_tot.*:u64:4096"
+
+	# be: fully valid object, both fields restored
+	send "show stat be 15 -1 typed"
+	expect ~ "B.*bin.*:u64:2048"
+	send "show stat be 15 -1 typed"
+	expect ~ "B.*stot.*:u64:1024"
+
+	# srv: corrupted field -> whole object dropped, valid bin (777) must NOT leak
+	send "show stat be 15 -1 typed"
+	expect !~ ":u64:777"
+}
+
+# --- generation 2: reloading the same corrupted file stays consistent ---------
+haproxy h2 -conf {
+	global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+		stats-file ${testdir}/sample-stats-file-preload
+
+	defaults
+		timeout client 30s
+		timeout server 30s
+		timeout connect 30s
+
+	frontend fe
+		guid guid-fe
+		bind "fd@${feS}"
+
+	frontend fe2
+		guid guid-fe2
+		bind "fd@${fe2S}"
+
+	backend be
+		guid guid-be
+		server srv 127.0.0.1:11111 guid guid-srv
+} -start
+
+haproxy h2 -cli {
+	send "show stat fe 15 -1 typed"
+	expect ~ "F.*conn_tot.*:u64:4096"
+	send "show stat fe 15 -1 typed"
+	expect ~ "F.*stot.*:u64:2048"
+
+	send "show stat fe2 15 -1 typed"
+	expect !~ "conn_tot.*:u64:4096"
+
+	send "show stat be 15 -1 typed"
+	expect ~ "B.*bin.*:u64:2048"
+	send "show stat be 15 -1 typed"
+	expect ~ "B.*stot.*:u64:1024"
+
+	send "show stat be 15 -1 typed"
+	expect !~ ":u64:777"
+}
+
+# --- generation 3: a later clean file restores the dropped objects ------------
+haproxy h3 -conf {
+	global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+		stats-file ${testdir}/sample-stats-file-preload-clean
+
+	defaults
+		timeout client 30s
+		timeout server 30s
+		timeout connect 30s
+
+	frontend fe
+		guid guid-fe
+		bind "fd@${feS}"
+
+	frontend fe2
+		guid guid-fe2
+		bind "fd@${fe2S}"
+
+	backend be
+		guid guid-be
+		server srv 127.0.0.1:11111 guid guid-srv
+} -start
+
+haproxy h3 -cli {
+	# everything is valid now: fe and be still restored
+	send "show stat fe 15 -1 typed"
+	expect ~ "F.*conn_tot.*:u64:4096"
+	send "show stat be 15 -1 typed"
+	expect ~ "B.*bin.*:u64:2048"
+
+	# fe2 and srv that were dropped before are fully restored from the clean file
+	send "show stat fe2 15 -1 typed"
+	expect ~ "F.*conn_tot.*:u64:4096"
+	send "show stat be 15 -1 typed"
+	expect ~ "S.*bin.*:u64:777"
+}

@@ -1,0 +1,18 @@
+#fe guid,conn_tot,stot,
+
+// fully valid frontend line: every field must be restored
+guid-fe,4096,2048,
+
+// partially corrupt frontend line: conn_tot is valid but stot is garbage.
+// The whole object must be discarded (no half-restore), so conn_tot must NOT
+// end up applied on its own.
+guid-fe2,4096,corrupt,
+
+#be guid,bin,stot,
+
+// fully valid backend line: every field must be restored
+guid-be,2048,1024,
+
+// partially corrupt server line: bin is valid but stot is garbage.
+// The whole object must be discarded, so bin (777) must NOT be applied alone.
+guid-srv,777,corrupt,

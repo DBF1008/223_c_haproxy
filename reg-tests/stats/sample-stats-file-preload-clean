@@ -1,0 +1,12 @@
+#fe guid,conn_tot,stot,
+
+// same objects as sample-stats-file-preload but every line is valid: a clean
+// stats-file produced by a later reload generation must restore everything,
+// including the objects that were dropped from the corrupted file.
+guid-fe,4096,2048,
+guid-fe2,4096,2048,
+
+#be guid,bin,stot,
+
+guid-be,2048,1024,
+guid-srv,777,512,
