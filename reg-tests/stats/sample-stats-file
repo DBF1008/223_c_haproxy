@@ -3,7 +3,7 @@
 // valid line
 guid-fe,1024,
 
-// invalid non numerical value must be silently ignored
+// invalid non numerical value: line is rolled back, previous value (1024) preserved
 guid-fe,abc,
 
 // listener counters not allocated if no option socket-stats

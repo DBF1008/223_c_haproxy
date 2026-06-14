@@ -259,7 +259,13 @@ static int load_ctr(const struct stat_col *col, const struct ist token,
 /* Parse a non header stats-file line <line>. Specify current parsing <domain>
  * and <cols> stats column matrix derived from the last header line.
  *
- * Returns 0 on success else non-zero.
+ * Counter updates for a single line are applied atomically: if any
+ * individual field fails to load (malformed value, unsupported format), all
+ * changes made by this line are rolled back so the target object never ends
+ * up in a partially-preloaded state.
+ *
+ * Returns 0 on success (including silently ignored lines), non-zero if a
+ * parse or load error occurred (after rollback).
  */
 static int parse_stat_line(struct ist line,
                            enum stfile_domain domain,
@@ -273,6 +279,18 @@ static int parse_stat_line(struct ist line,
 	char *base_off, *base_off_shared;
 	char *guid;
 	int i, off;
+	/* Snapshot buffers: large enough for any counter struct variant.
+	 * sizeof on fixed types yields integer constant expressions, so the
+	 * ternary is valid as an array bound at compile time.
+	 */
+	char snap_shared[(sizeof(struct fe_counters_shared_tg) > sizeof(struct be_counters_shared_tg))
+	                 ? sizeof(struct fe_counters_shared_tg)
+	                 : sizeof(struct be_counters_shared_tg)];
+	char snap_local[(sizeof(struct fe_counters) > sizeof(struct be_counters))
+	                ? sizeof(struct fe_counters)
+	                : sizeof(struct be_counters)];
+	size_t snap_shared_sz = 0, snap_local_sz = 0;
+	int errcnt = 0;
 
 	token = istsplit(&line, ',');
 	guid = ist0(token);
@@ -302,6 +320,9 @@ static int parse_stat_line(struct ist line,
 
 			base_off = (char *)&px->fe_counters;
 
+			snap_shared_sz = sizeof(struct fe_counters_shared_tg);
+			snap_local_sz = sizeof(struct fe_counters);
+
 			off = 0;
 		}
 		else if (domain == STFILE_DOMAIN_PX_BE) {
@@ -316,6 +337,9 @@ static int parse_stat_line(struct ist line,
 				return 0; // not allocated
 
 			base_off = (char *)&px->be_counters;
+
+			snap_shared_sz = sizeof(struct be_counters_shared_tg);
+			snap_local_sz = sizeof(struct be_counters);
 
 			off = 1;
 		}
@@ -343,6 +367,9 @@ static int parse_stat_line(struct ist line,
 
 		base_off = (char *)li->counters;
 
+		snap_shared_sz = sizeof(struct fe_counters_shared_tg);
+		snap_local_sz = sizeof(struct fe_counters);
+
 		off = 0;
 		break;
 
@@ -360,12 +387,21 @@ static int parse_stat_line(struct ist line,
 
 		base_off = (char *)&srv->counters;
 
+		snap_shared_sz = sizeof(struct be_counters_shared_tg);
+		snap_local_sz = sizeof(struct be_counters);
+
 		off = 1;
 		break;
 
 	default:
 		goto err;
 	}
+
+	/* Save a snapshot of both counter regions before any modification so
+	 * that we can roll back the entire line on partial failure.
+	 */
+	memcpy(snap_shared, base_off_shared, snap_shared_sz);
+	memcpy(snap_local, base_off, snap_local_sz);
 
 	i = 0;
 	while (istlen(line) && i < STAT_FILE_MAX_COL_COUNT) {
@@ -378,10 +414,22 @@ static int parse_stat_line(struct ist line,
 		if (!col)
 			continue;
 
-		if (col->flags & STAT_COL_FL_SHARED)
-			load_ctr(col, token, base_off_shared + col->metric.offset[off]);
-		else
-			load_ctr(col, token, base_off + col->metric.offset[off]);
+		if (col->flags & STAT_COL_FL_SHARED) {
+			if (load_ctr(col, token, base_off_shared + col->metric.offset[off]))
+				++errcnt;
+		} else {
+			if (load_ctr(col, token, base_off + col->metric.offset[off]))
+				++errcnt;
+		}
+	}
+
+	/* If any field failed to load, roll back the entire line to avoid
+	 * leaving the object with a mix of old and new counter values.
+	 */
+	if (errcnt) {
+		memcpy(base_off_shared, snap_shared, snap_shared_sz);
+		memcpy(base_off, snap_local, snap_local_sz);
+		return 1;
 	}
 
 	return 0;
@@ -397,6 +445,7 @@ void apply_stats_file(void)
 	struct eb_root st_tree = EB_ROOT;
 	enum stfile_domain domain;
 	int valid_format = 0;
+	int failed_lines = 0;
 	FILE *file;
 	struct ist istline;
 	char *line = NULL;
@@ -451,8 +500,10 @@ void apply_stats_file(void)
 			valid_format = 1;
 		}
 		else if (domain != STFILE_DOMAIN_UNSET) {
-			if (parse_stat_line(istline, domain, cols))
-				ha_warning("config: Ignored stats-file line %d in file '%s'.\n", linenum, global.stats_file);
+			if (parse_stat_line(istline, domain, cols)) {
+				ha_warning("config: Ignored stats-file line %d in file '%s' (rolled back).\n", linenum, global.stats_file);
+				++failed_lines;
+			}
 		}
 		else {
 			/* Stop parsing if first line is not a valid header.
@@ -464,6 +515,13 @@ void apply_stats_file(void)
 			}
 		}
 	}
+
+	/* Emit a summary warning if any lines failed so operators know that
+	 * some counters were not restored and may be inconsistent.
+	 */
+	if (failed_lines)
+		ha_warning("config: stats-file '%s': %d line(s) could not be fully restored and were rolled back.\n",
+		           global.stats_file, failed_lines);
 
  out:
 	while (!eb_is_empty(&st_tree)) {
@@ -813,7 +871,7 @@ static void shm_stats_file_preload(void)
 					} else if (curr_obj->type == SHM_STATS_FILE_OBJECT_TYPE_BE) {
 						if (!px->be_counters.shared.tg)
 							px->be_counters.shared.tg = calloc(global.nbtgroups, sizeof(*px->be_counters.shared.tg));
-						if (px->fe_counters.shared.tg == NULL)
+						if (px->be_counters.shared.tg == NULL)
 							goto release;
 						px->be_counters.shared.tg[obj_tgid - 1] = &curr_obj->data.be;
 					} else
