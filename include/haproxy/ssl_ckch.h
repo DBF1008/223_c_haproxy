@@ -46,7 +46,7 @@ struct ckch_store *ckchs_lookup(char *path);
 struct ckch_store *ckchs_dup(const struct ckch_store *src);
 struct ckch_store *ckch_store_new(const char *filename);
 void ckch_store_free(struct ckch_store *store);
-void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs);
+int ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs);
 int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, const char *file, int linenum, char **err);
 int ckch_store_create(char *path, char **err);
 int ckch_store_load_payload(char *path, char *payload, char **err);

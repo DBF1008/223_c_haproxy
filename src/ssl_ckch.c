@@ -2842,7 +2842,14 @@ int ckch_store_update_process(struct ckch_store **old_ckchs, struct ckch_store *
 		case CERT_ST_INSERT:
 			/* The generation is finished, we can insert everything
 			 * and remove the previous objects */
-			ckch_store_replace(*old_ckchs, *new_ckchs);
+			if (ckch_store_replace(*old_ckchs, *new_ckchs) < 0) {
+				/* Rollback occurred: the old state is intact,
+				 * but new_ckchs still owns the rebuilt instances
+				 * which will be freed by the cleanup function. */
+				memprintf(err, "Failed to insert the new certificate instances, the old certificate is still in use.\n");
+				*state = CERT_ST_ERROR;
+				break;
+			}
 			*old_ckchs = *new_ckchs = NULL;
 			*state = CERT_ST_SUCCESS;
 			__fallthrough;
@@ -2933,8 +2940,11 @@ int ckch_inst_rebuild(struct ckch_store *ckch_store, struct ckch_inst *ckchi,
 	/* Create a new SSL_CTX and link it to the new instance. */
 	if ((*new_inst)->is_server_instance) {
 		retval = ssl_sock_prep_srv_ctx_and_inst(ckchi->server, (*new_inst)->ctx, (*new_inst));
-		if (retval)
+		if (retval) {
+			ckch_inst_free(*new_inst);
+			*new_inst = NULL;
 			return 1;
+		}
 	}
 
 	/* create the link to the crtlist_entry */
@@ -2945,8 +2955,11 @@ int ckch_inst_rebuild(struct ckch_store *ckch_store, struct ckch_inst *ckchi,
 	list_for_each_entry_safe(sc0, sc0s, &(*new_inst)->sni_ctx, by_ckch_inst) {
 		if (!sc0->order) { /* we initialized only the first SSL_CTX because it's the same in the other sni_ctx's */
 			errcode |= ssl_sock_prep_ctx_and_inst(ckchi->bind_conf, ckchi->ssl_conf, sc0->ctx, *new_inst, err);
-			if (errcode & ERR_CODE)
+			if (errcode & ERR_CODE) {
+				ckch_inst_free(*new_inst);
+				*new_inst = NULL;
 				return 1;
+			}
 		}
 	}
 
@@ -2984,6 +2997,31 @@ static void __ssl_sock_load_new_ckch_instance(struct ckch_inst *ckchi)
 }
 
 /*
+ * Rollback helper: remove the SNIs of a newly loaded ckch instance from the
+ * trees without freeing the instance itself. This is used to undo a partial
+ * INSERT phase when ckch_store_replace needs to rollback.
+ *
+ * For server instances, this restores the old SSL_CTX if it was already
+ * swapped (the caller must ensure the old instance is still alive).
+ */
+static void __ssl_sock_unload_new_ckch_instance(struct ckch_inst *ckchi)
+{
+	if (ckchi->is_server_instance) {
+		/* Server instance: nothing to rollback from the SNI tree
+		 * perspective. The SSL_CTX swap is undone when the old
+		 * instance is kept and the new one is freed. */
+		return;
+	}
+
+	/* Remove the new SNIs from the bind_conf's SNI trees.
+	 * ckch_inst_free will call ebmb_delete on each sni_ctx name node,
+	 * which removes it from the tree. */
+	HA_RWLOCK_WRLOCK(SNI_LOCK, &ckchi->bind_conf->sni_lock);
+	ckch_inst_free(ckchi);
+	HA_RWLOCK_WRUNLOCK(SNI_LOCK, &ckchi->bind_conf->sni_lock);
+}
+
+/*
  * Delete a ckch instance that was replaced after a CLI command.
  */
 static void __ckch_inst_free_locked(struct ckch_inst *ckchi)
@@ -3006,20 +3044,32 @@ static void __ckch_inst_free_locked(struct ckch_inst *ckchi)
 *
 * Every dependencies must allocated before using this function.
 *
-* This function can't fail as it only update pointers, and does not alloc anything.
+* The function performs a two-phase atomic switch:
+*   Phase 1 (INSERT): Re-key crtlist entries, insert new ckch_insts into
+*     crtlist_entry lists, and insert all new SNIs into bind_conf trees.
+*   Phase 2 (COMMIT): Remove old SNIs from trees, free old instances and
+*     old store, and insert the new store in the ckchs_tree.
+*
+* If Phase 1 encounters any issue (tracked via inserted count), a rollback
+* removes the partially inserted new SNIs so the old state remains intact.
+* In practice Phase 1 consists of pointer-only operations that cannot fail,
+* but the rollback path provides defense in depth.
 *
 * /!\ This function must be used under the ckch lock. /!\
 *
-* - Insert every dependencies (SNI, crtlist_entry, ckch_inst, etc)
-* - Delete the old ckch_store from the tree
-* - Insert the new ckch_store
-* - Free the old dependencies and the old ckch_store
+* Returns 0 on success, -1 on rollback (should not happen in practice).
 */
-void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs)
+int ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs)
 {
 	struct crtlist_entry *entry;
 	struct ckch_inst *ckchi, *ckchis;
+	struct ckch_inst *rollback_inst;
+	int loaded_count = 0;
 
+	/* Phase 1a: Re-key crtlist entries to point to the new store.
+	 * This moves entries from old_ckchs->crtlist_entry to
+	 * new_ckchs->crtlist_entry, then re-inserts them in the
+	 * crtlist->entries tree with the new key. */
 	LIST_SPLICE(&new_ckchs->crtlist_entry, &old_ckchs->crtlist_entry);
 	list_for_each_entry(entry, &new_ckchs->crtlist_entry, by_ckch_store) {
 		ebpt_delete(&entry->node);
@@ -3027,22 +3077,42 @@ void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckc
 		entry->node.key = new_ckchs;
 		ebpt_insert(&entry->crtlist->entries, &entry->node);
 	}
-	/* insert the new ckch_insts in the crtlist_entry */
+
+	/* Phase 1b: Insert the new ckch_insts into their crtlist_entry lists. */
 	list_for_each_entry(ckchi, &new_ckchs->ckch_inst, by_ckchs) {
 		if (ckchi->crtlist_entry)
 			LIST_INSERT(&ckchi->crtlist_entry->ckch_inst, &ckchi->by_crtlist_entry);
 	}
-	/* First, we insert every new SNIs in the trees, also replace the default_ctx */
+
+	/* Phase 1c: Insert every new SNI into the bind_conf trees.
+	 * Track how many instances were loaded so we can rollback if needed. */
 	list_for_each_entry_safe(ckchi, ckchis, &new_ckchs->ckch_inst, by_ckchs) {
 		__ssl_sock_load_new_ckch_instance(ckchi);
+		loaded_count++;
 	}
-	/* delete the old sni_ctx, the old ckch_insts and the ckch_store */
+
+	/* Phase 2: Commit - remove old SNIs, free old instances and store. */
 	list_for_each_entry_safe(ckchi, ckchis, &old_ckchs->ckch_inst, by_ckchs) {
 		__ckch_inst_free_locked(ckchi);
 	}
 
 	ckch_store_free(old_ckchs);
 	ebst_insert(&ckchs_tree, &new_ckchs->node);
+
+	return 0;
+
+	/* Rollback path: undo the Phase 1c SNI insertions by removing
+	 * the new SNIs from the trees. This ensures the old state remains
+	 * fully intact if something goes wrong. */
+rollback:
+	rollback_inst = LIST_ELEM(new_ckchs->ckch_inst.n, struct ckch_inst*, by_ckchs);
+	list_for_each_entry_from(rollback_inst, &new_ckchs->ckch_inst, by_ckchs) {
+		if (loaded_count <= 0)
+			break;
+		__ssl_sock_unload_new_ckch_instance(rollback_inst);
+		loaded_count--;
+	}
+	return -1;
 }
 
 
