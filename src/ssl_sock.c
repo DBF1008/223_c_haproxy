@@ -1800,6 +1800,13 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 			conn->err_code = CO_ER_SSL_CA_FAIL;
 			TRACE_ERROR("Verify callback error (ca)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, conn, ssl, &conn->err_code, &err);
 		}
+#ifdef USE_QUIC
+		/* For QUIC, propagate the TLS alert so the specific error is
+		 * preserved in qc->err.code and ultimately in conn->err_code
+		 * via ha_quic_send_alert() -> quic_tls_alert_to_co_er(). */
+		if (qc)
+			quic_set_tls_alert(qc, SSL_AD_BAD_CERTIFICATE);
+#endif
 		return 0;
 	}
 
@@ -1818,6 +1825,13 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 		conn->err_code = CO_ER_SSL_CRT_FAIL;
 		TRACE_ERROR("Verify callback error (crt)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, conn, ssl, &conn->err_code, &err);
 	}
+#ifdef USE_QUIC
+	/* For QUIC, propagate the TLS alert so the specific error is
+	 * preserved in qc->err.code and ultimately in conn->err_code
+	 * via ha_quic_send_alert() -> quic_tls_alert_to_co_er(). */
+	if (qc)
+		quic_set_tls_alert(qc, SSL_AD_BAD_CERTIFICATE);
+#endif
 	return 0;
 
  err_ignored:

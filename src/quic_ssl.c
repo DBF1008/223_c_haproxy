@@ -176,6 +176,13 @@ static int ha_quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8
 
 	quic_set_tls_alert(qc, alert);
 	if (qc->conn) {
+		/* Map the TLS alert to a specific CO_ER_* code before
+		 * ssl_sock_handle_hs_error() which would set the generic
+		 * CO_ER_SSL_HANDSHAKE fallback. conn_set_errcode() uses
+		 * first-error-wins semantics, so if the verify callback
+		 * already set a more specific code (e.g. CO_ER_SSL_CA_FAIL),
+		 * this is a no-op. */
+		conn_set_errcode(qc->conn, quic_tls_alert_to_co_er(alert));
 		ssl_sock_handle_hs_error(qc->conn);
 		if (objt_server(qc->conn->target) && !qc->conn->mux) {
 			/* This has as side effect to close the connection stream */

@@ -267,6 +267,27 @@ void quic_set_tls_alert(struct quic_conn *qc, int alert)
 	TRACE_LEAVE(QUIC_EV_CONN_SSLALERT, qc);
 }
 
+/* Map a TLS alert code to the most specific CO_ER_* connection error code.
+ * This bridges the QUIC TLS alert (stored in qc->err.code as 0x100|alert)
+ * to the connection-level error code (conn->err_code) used by logs, stats,
+ * and sample fetches (fc_err, bc_err).
+ */
+int quic_tls_alert_to_co_er(int alert)
+{
+	switch (alert) {
+	case SSL_AD_BAD_CERTIFICATE:
+	case SSL_AD_CERTIFICATE_EXPIRED:
+	case SSL_AD_CERTIFICATE_REVOKED:
+	case SSL_AD_CERTIFICATE_UNKNOWN:
+	case SSL_AD_UNSUPPORTED_CERTIFICATE:
+		return CO_ER_SSL_CRT_FAIL;
+	case SSL_AD_UNKNOWN_CA:
+		return CO_ER_SSL_CA_FAIL;
+	default:
+		return CO_ER_SSL_HANDSHAKE;
+	}
+}
+
 /* Register the negotiated TLS ALPN <alpn> of length <alpn_len> for <qc> QUIC
  * connection. This checks that the protocol is compatible with the QUIC stack.
  *
