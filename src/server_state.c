@@ -449,11 +449,21 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 #endif
 	}
 
+	/* Restore the health-check target address/port from the state file ONLY
+	 * when the running configuration declares them as independently configured
+	 * (SRV_F_CHECKADDR / SRV_F_CHECKPORT). When the check target instead
+	 * follows the (re)resolved server address, applying a stale state-file
+	 * value here would wrongly pin the probe to an outdated IP/port while
+	 * production traffic has already moved to the freshly resolved target,
+	 * causing the server to be flapped down. In that case we keep the check
+	 * tracking the server address so that forwarding and health-check targets
+	 * always come from the same resolution snapshot.
+	 */
 	port_st = NULL;
-	if (params[17] && strcmp(params[17], "0") != 0)
+	if ((srv->flags & SRV_F_CHECKPORT) && params[17] && strcmp(params[17], "0") != 0)
 		port_st = params[17];
 	addr = NULL;
-	if (params[18] && strcmp(params[18], "-") != 0)
+	if ((srv->flags & SRV_F_CHECKADDR) && params[18] && strcmp(params[18], "-") != 0)
 		addr = params[18];
 	if (addr || port_st) {
 		warning = srv_update_check_addr_port(srv, addr, port_st);

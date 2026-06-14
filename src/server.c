@@ -2967,6 +2967,11 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->agent.alt_proto          = src->agent.alt_proto;
 	srv->check.use_ssl            = src->check.use_ssl;
 	srv->check.port               = src->check.port;
+	/* propagate the "check target is independently configured" markers so that
+	 * a check addr/port inherited from a default-server or a server-template
+	 * keeps being treated as an explicit (non-resolution-following) target.
+	 */
+	srv->flags |= src->flags & (SRV_F_CHECKADDR | SRV_F_CHECKPORT);
 	if (src->check.sni != NULL)
 		srv->check.sni = strdup(src->check.sni);
 	if (src->check.alpn_str) {
@@ -5677,6 +5682,15 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 			port = args[6];
 		HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 		warning = srv_update_check_addr_port(sv, addr, port);
+		if (!warning) {
+			/* the operator explicitly pins the check target: mark it as
+			 * independently configured so that it is preserved and never
+			 * silently overridden by a resolution refresh.
+			 */
+			sv->flags |= SRV_F_CHECKADDR;
+			if (port)
+				sv->flags |= SRV_F_CHECKPORT;
+		}
 		HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 		if (warning)
 			cli_msg(appctx, LOG_WARNING, warning);
@@ -5691,6 +5705,8 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 		port = args[4];
 		HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 		warning = srv_update_check_addr_port(sv, NULL, port);
+		if (!warning)
+			sv->flags |= SRV_F_CHECKPORT;
 		HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 		if (warning)
 			cli_msg(appctx, LOG_WARNING, warning);

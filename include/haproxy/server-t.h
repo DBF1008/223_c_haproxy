@@ -174,6 +174,8 @@ enum srv_init_state {
 #define SRV_F_STRICT_MAXCONN 0x10000     /* maxconn is to be strictly enforced, as a limit of outbound connections */
 #define SRV_F_CHK_NO_AUTO_SNI 0x20000    /* disable automatic SNI selection for healthcheck */
 #define SRV_F_UDP_GSO_NOTSUPP 0x40000    /* UDP GSO is disabled due to a previous error encountered */
+#define SRV_F_CHECKADDR    0x80000       /* this server has a check addr configured: the health-check target address is independent from the (resolved) server address */
+#define SRV_F_CHECKPORT    0x100000      /* this server has a check port configured: the health-check target port is independent from the server svc_port */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */

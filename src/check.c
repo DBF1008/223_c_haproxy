@@ -2125,6 +2125,11 @@ static int srv_parse_addr(char **args, int *cur_arg, struct proxy *curpx, struct
 	srv->check.addr = *sk;
 	srv->check.addr_type = addr_type;
 	srv->check.alt_proto = alt;
+	/* the check target address is now explicitly pinned by configuration: it
+	 * must be preserved across reloads and must never silently follow the
+	 * resolved server address.
+	 */
+	srv->flags |= SRV_F_CHECKADDR;
 	/* if agentaddr was never set, we can use addr */
 	if (!(srv->flags & SRV_F_AGENTADDR))
 		srv->agent.addr = *sk;
@@ -2732,6 +2737,8 @@ static int srv_parse_check_port(char **args, int *cur_arg, struct proxy *curpx, 
 		global.maxsock++;
 
 	srv->check.port = atol(args[*cur_arg+1]);
+	/* the check target port is now explicitly pinned by configuration */
+	srv->flags |= SRV_F_CHECKPORT;
 	/* if agentport was never set, we can use port */
 	if (!(srv->flags & SRV_F_AGENTPORT))
 		srv->agent.port = srv->check.port;
