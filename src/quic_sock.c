@@ -129,6 +129,14 @@ static int new_quic_cli_conn(struct quic_conn *qc, struct listener *l,
 	qc->conn = cli_conn;
 	cli_conn->handle.qc = qc;
 
+	/* Propagate any TLS/handshake failure reason recorded on the quic_conn
+	 * before this connection existed (e.g. by the certificate verification
+	 * callback) so that it remains visible through the fc_err/fc_err_str
+	 * sample fetches and the logs, like for the TCP/TLS stack.
+	 */
+	if (qc->err_code && !cli_conn->err_code)
+		cli_conn->err_code = qc->err_code;
+
 	cli_conn->target = &l->obj_type;
 
 	return 1;

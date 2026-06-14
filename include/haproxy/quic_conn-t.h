@@ -272,6 +272,11 @@ struct qcc_app_ops;
         int fd;                                        \
         unsigned int flags;                            \
         struct quic_err err;                           \
+        /* Connection-level error reason (CO_ER_*), kept so that a TLS/      \
+         * handshake failure is not lost when no upper <conn> exists yet.    \
+         * It is mirrored to conn->err_code once the connection is attached. \
+         */                                                                  \
+        unsigned char err_code;                        \
         /* When in closing state, number of packet before sending CC */  \
         unsigned int nb_pkt_for_cc;                    \
         /* When in closing state, number of packet since receiving CC */ \

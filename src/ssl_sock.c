@@ -1795,11 +1795,21 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 			goto err_ignored;
 		}
 
-		/* TODO: for QUIC connection, this error code is lost */
+		/* Record the failure reason. On the QUIC frontend, no upper
+		 * <conn> exists yet during the handshake, so the reason is stored
+		 * on the quic_conn and later mirrored to conn->err_code by
+		 * new_quic_cli_conn().
+		 */
 		if (conn) {
 			conn->err_code = CO_ER_SSL_CA_FAIL;
 			TRACE_ERROR("Verify callback error (ca)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, conn, ssl, &conn->err_code, &err);
 		}
+#ifdef USE_QUIC
+		else if (qc) {
+			quic_conn_set_err_code(qc, CO_ER_SSL_CA_FAIL);
+			TRACE_ERROR("Verify callback error (ca)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, NULL, ssl, &qc->err_code, &err);
+		}
+#endif
 		return 0;
 	}
 
@@ -1813,11 +1823,20 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 		goto err_ignored;
 	}
 
-	/* TODO: for QUIC connection, this error code is lost */
+	/* Record the failure reason. On the QUIC frontend, no upper <conn>
+	 * exists yet during the handshake, so the reason is stored on the
+	 * quic_conn and later mirrored to conn->err_code by new_quic_cli_conn().
+	 */
 	if (conn) {
 		conn->err_code = CO_ER_SSL_CRT_FAIL;
 		TRACE_ERROR("Verify callback error (crt)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, conn, ssl, &conn->err_code, &err);
 	}
+#ifdef USE_QUIC
+	else if (qc) {
+		quic_conn_set_err_code(qc, CO_ER_SSL_CRT_FAIL);
+		TRACE_ERROR("Verify callback error (crt)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, NULL, ssl, &qc->err_code, &err);
+	}
+#endif
 	return 0;
 
  err_ignored:

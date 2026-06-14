@@ -944,6 +944,13 @@ int qc_ssl_do_hanshake(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 			HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
 			qc_ssl_dump_errors(qc->conn);
 			ERR_clear_error();
+			/* Record a connection-level reason so that logs, the
+			 * fc_err/bc_err sample fetches and "show quic" expose the
+			 * handshake failure instead of a generic close. A more
+			 * specific reason (TLS alert or certificate verification
+			 * error) already recorded is preserved.
+			 */
+			quic_conn_set_err_code(qc, CO_ER_SSL_HANDSHAKE);
 			goto err;
 		}
 		else if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
@@ -956,6 +963,7 @@ int qc_ssl_do_hanshake(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 			 */
 			TRACE_ERROR("SSL handshake error", QUIC_EV_CONN_IO_CB, qc, &state, &ssl_err);
 			HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
+			quic_conn_set_err_code(qc, CO_ER_SSL_HANDSHAKE);
 			goto err;
 		}
 

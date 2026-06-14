@@ -262,9 +262,33 @@ void quic_set_tls_alert(struct quic_conn *qc, int alert)
 
 	quic_set_connection_close(qc, quic_err_tls(alert));
 	qc->flags |= QUIC_FL_CONN_TLS_ALERT;
+	/* Keep a connection-level error reason for logs and the fc_err/bc_err
+	 * sample fetches. A more specific reason already recorded (e.g. by the
+	 * certificate verification callback) is preserved.
+	 */
+	quic_conn_set_err_code(qc, CO_ER_SSL_HANDSHAKE);
 	TRACE_STATE("Alert set", QUIC_EV_CONN_SSLALERT, qc);
 
 	TRACE_LEAVE(QUIC_EV_CONN_SSLALERT, qc);
+}
+
+/* Record connection-level error reason <err_code> (a CO_ER_* value) on <qc>.
+ * The first recorded reason is kept so that a specific error (for instance a
+ * certificate verification failure detected before the generic TLS alert) is
+ * not overwritten by a later, more generic one. When an upper connection is
+ * already attached (always the case on the backend, and on the frontend once
+ * the connection has been accepted), the reason is mirrored to
+ * conn->err_code so that it becomes visible through the fc_err/bc_err sample
+ * fetches and the logs. On the frontend, before the connection exists, the
+ * reason is propagated later by new_quic_cli_conn().
+ */
+void quic_conn_set_err_code(struct quic_conn *qc, int err_code)
+{
+	if (!qc->err_code)
+		qc->err_code = err_code;
+
+	if (qc->conn && !qc->conn->err_code)
+		qc->conn->err_code = qc->err_code;
 }
 
 /* Register the negotiated TLS ALPN <alpn> of length <alpn_len> for <qc> QUIC
@@ -1162,6 +1186,7 @@ struct quic_conn *qc_new_conn(void *target,
 
 	qc->xprt_ctx = NULL;
 	qc->conn = conn;
+	qc->err_code = 0;
 	qc->qcc = NULL;
 	qc->strm_reject = NULL;
 	qc->path = NULL;

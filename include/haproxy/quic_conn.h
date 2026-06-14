@@ -204,6 +204,7 @@ static inline void *qc_counters(enum obj_type *o, const struct stats_module *m)
 void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 void quic_set_connection_close(struct quic_conn *qc, const struct quic_err err);
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
+void quic_conn_set_err_code(struct quic_conn *qc, int err_code);
 int qc_register_alpn(struct quic_conn *qc, const char *alpn, int alpn_len);
 int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len);
 
