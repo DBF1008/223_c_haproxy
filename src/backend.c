@@ -1873,7 +1873,13 @@ int connect_server(struct stream *s)
 
 		if (err == SF_ERR_NONE) {
 			srv_conn = sc_conn(s->scb);
-			reuse = 1;
+			/* the mux may have refused the attach on a draining
+			 * connection (e.g. H2 GOAWAY received): in that case
+			 * sc_conn() is NULL and we must treat this as a fresh
+			 * connect, not a reuse, so the new-connection path below
+			 * (including 0-RTT eligibility) behaves correctly.
+			 */
+			reuse = !!srv_conn;
 			if (srv_conn && srv_conn->mux)
 				may_start_mux_now = 0;
 		}

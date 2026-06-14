@@ -1260,6 +1260,15 @@ static int h2_avail_streams(struct connection *conn)
 	if (h2c->st0 >= H2_CS_ERROR)
 		return 0;
 
+	/* A connection that has sent or failed to send a GOAWAY, that has had
+	 * its read side shut down, or that is in error can no longer accept a
+	 * new outgoing stream: it is draining and must not be reused. Reporting
+	 * 0 here keeps this advisory count consistent with the attach decision.
+	 */
+	if (h2c->flags & (H2_CF_ERR_PENDING | H2_CF_ERROR | H2_CF_RCVD_SHUT |
+	                  H2_CF_GOAWAY_SENT | H2_CF_GOAWAY_FAILED))
+		return 0;
+
 	/* note: may be negative if a SETTINGS frame changes the limit */
 	ret1 = h2c->streams_limit - h2c->nb_streams;
 
@@ -5357,6 +5366,19 @@ static int h2_process(struct h2c *h2c)
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
+	else if ((h2c->flags & H2_CF_IS_BACK) && h2c->last_sid >= 0) {
+		/* a backend connection that received a GOAWAY can no longer be
+		 * handed a new stream; evict it from the idle/available trees
+		 * right away so it is never offered for reuse. Its in-flight
+		 * streams keep it alive; it is released through the empty +
+		 * last-stream path above once fully drained.
+		 */
+		if (conn->flags & CO_FL_LIST_MASK) {
+			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			conn_delete_from_tree(conn, tid);
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		}
+	}
 
 	if (!b_data(&h2c->dbuf))
 		h2_release_buf(h2c, &h2c->dbuf);
@@ -5571,6 +5593,19 @@ static int h2_attach(struct connection *conn, struct sedesc *sd, struct session 
 	struct h2c *h2c = conn->ctx;
 
 	TRACE_ENTER(H2_EV_H2S_NEW, conn);
+
+	/* Between the reuse decision (which consulted h2_avail_streams()) and
+	 * this attach, the connection may have started draining (GOAWAY
+	 * received, read side shut, or error). Re-check with the very same
+	 * predicate to close the time-of-check/time-of-use gap. On refusal the
+	 * caller (connect_server()) transparently falls back to a fresh
+	 * connection.
+	 */
+	if (h2_avail_streams(conn) < 1) {
+		TRACE_DEVEL("leaving, connection draining, cannot attach", H2_EV_H2S_NEW|H2_EV_H2S_ERR, conn);
+		return -1;
+	}
+
 	h2s = h2c_bck_stream_new(h2c, sd->sc, sess);
 	if (!h2s) {
 		TRACE_DEVEL("leaving on stream creation failure", H2_EV_H2S_NEW|H2_EV_H2S_ERR, conn);
@@ -6319,7 +6354,7 @@ next_frame:
 	 * to convert 200 response to 101 htx response. We only support this if
 	 * the connection supports RFC8441.
 	 * On the backend, that means the origin server advertised the setting.
-	 * On the frontend, RFC 8441 §3 only requires the server (us) to
+	 * On the frontend, RFC 8441 ï¿½3 only requires the server (us) to
 	 * advertise it; clients are not required to echo it back. Use whether
 	 * we ourselves advertised it as the gate.
 	 */
